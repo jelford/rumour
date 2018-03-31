@@ -4,9 +4,6 @@ use std::net::SocketAddr;
 use bincode::{serialize_into, deserialize, Bounded, Result as BincodeResult, ErrorKind as BincodeErrorKind};
 use tokio_core::net::UdpCodec;
 
-#[macro_use] use fixed_list;
-
-
 #[derive(Debug, Hash, Eq, PartialEq, Copy, Clone, Serialize, Deserialize)]
 pub(crate) struct NodeId(pub SocketAddr);
 
@@ -88,7 +85,8 @@ pub(crate) enum ControlRequest {
 
 #[derive(Debug, Eq, PartialEq, Clone, Serialize, Deserialize, Copy)]
 pub(crate) enum Rumour {
-    NodeHasJoin(NodeId)
+    NodeHasJoin(NodeId),
+    NodeHasLeft(NodeId),
 }
 
 pub(crate) struct RumourCodec;
@@ -104,7 +102,7 @@ impl UdpCodec for RumourCodec {
         let deserialized: BincodeResult<MessageContent> = deserialize(&buf);
         match deserialized {
             Ok(inbound_data) => {
-                println!("<<< Received: {:?}", inbound_data);
+                debug!("<<< Received: {:?}", inbound_data);
                 Ok(InboundMessage { source: src.clone(), content: inbound_data })
             },
             Err(ek) => {
@@ -114,7 +112,7 @@ impl UdpCodec for RumourCodec {
                         panic!(format!("Bincode error: {}", msg))
                     },
                     _ => {
-                        println!("Bincode error: {:?}", ek);
+                        error!("Bincode error: {:?}", ek);
                         panic!("There was a problem deserializing inbound messaged. This is a fatal implementation fault. Processing will not resume.")
                     }
                 }
@@ -123,7 +121,7 @@ impl UdpCodec for RumourCodec {
     }
 
     fn encode(&mut self, msg: Self::Out, buf: &mut Vec<u8>) -> SocketAddr {
-        println!(">>> Sending {:?}", msg);
+        debug!(">>> Sending {:?}", msg);
         let encoding_attempt = serialize_into(buf, msg.content(), Bounded(_MAXIMUM_UDP_PACKET_CONTENT));
         if encoding_attempt.is_err() {
             panic!("Unable to send network messages; message too big. This is a fatal implementation fault. Processing will not resume.");

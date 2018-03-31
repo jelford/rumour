@@ -1,4 +1,4 @@
-use super::codec::Rumour;
+use super::codec::{Rumour, NodeId};
 use std::cmp::{min, Ord, PartialOrd, Ordering, PartialEq};
 
 #[derive(Debug, Eq)]
@@ -67,6 +67,14 @@ impl Gossip {
             return;
         }
         self.insert(GossipState{number_of_times_to_spread: 10, rumour: rumour});
+    }
+
+    pub(crate) fn forget(&mut self, node: NodeId) {
+        self.gossip.retain(|g| {
+            match g.rumour {
+                Rumour::NodeHasJoin(nid) | Rumour::NodeHasLeft(nid) => nid != node
+            }
+        });
     }
 }
 

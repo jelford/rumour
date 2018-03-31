@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use super::codec::{OutboundMessage, InboundMessage, NodeId, ControlRequest, MessageContent, RumourList, Rumour, KnownPeersList};
 use super::node_state::{self, NodeLivenessState};
 use super::gossip::{self, Gossip};
+use super::RumourObserver;
 
 pub(crate) trait MessageSender {
     fn send(&mut self, msg: OutboundMessage) -> ();
@@ -41,11 +42,12 @@ impl TimeoutRequest {
 }
 
 
-pub(crate) fn new_mill<RS, TR>(
+pub(crate) fn new_mill<'a, RS, TR>(
     id: NodeId,
     message_sender: RS,
     timeout_requester: TR,
-) -> RumourMill<RS, TR>
+    observer: Box<RumourObserver + 'a>,
+) -> RumourMill<'a, RS, TR>
 where
     RS: self::MessageSender,
     TR: self::TimeoutRequester,
@@ -55,7 +57,7 @@ where
         id: id,
         message_sender: message_sender,
         timeout_requester: timeout_requester,
-        node_state: node_state::new(),
+        node_state: node_state::new(observer),
         gossip: gossip::new(),
     }
 }
@@ -68,8 +70,7 @@ struct NodeState {
 
 /// The RumourMill is responsible for handling domain logic.
 ///
-#[derive(Debug)]
-pub(crate) struct RumourMill<RSender, TRequester>
+pub(crate) struct RumourMill<'a, RSender, TRequester>
 where
     RSender: MessageSender,
     TRequester: TimeoutRequester,
@@ -77,11 +78,11 @@ where
     id: NodeId,
     message_sender: RSender,
     timeout_requester: TRequester,
-    node_state: NodeLivenessState,
+    node_state: NodeLivenessState<'a>,
     gossip: Gossip,
 }
 
-impl <RSender, TRequester> RumourMill<RSender, TRequester>
+impl <'a, RSender, TRequester> RumourMill<'a, RSender, TRequester>
     where RSender : MessageSender, TRequester : TimeoutRequester {
 
         pub fn get_live_nodes(&self) -> Vec<NodeId> {
@@ -126,10 +127,9 @@ impl <RSender, TRequester> RumourMill<RSender, TRequester>
                     self.on_unknown_message(source);
                 },
                 &ControlRequest::PlainBytes(ref bs) => {
-                    println!("{}", ::std::string::String::from_utf8_lossy(&bs));
+                    info!("{}", ::std::string::String::from_utf8_lossy(&bs));
                 }
                 &ControlRequest::MemberJoin => {
-                    println!("Member joined {:?}", source);
                     self.on_member_join_request(source);
                 }
                 &ControlRequest::JoinAck(ref live_node_list) => {
@@ -147,10 +147,6 @@ impl <RSender, TRequester> RumourMill<RSender, TRequester>
             }
         }
 
-        pub fn trigger_begin_gossip(&mut self) {
-            println!("Beginning gossip");
-        }
-
         fn send_control_message(&mut self, destination: NodeId, content: ControlRequest) {
             let rumours = self.gossip.pull_rumours(RumourList::capacity());
 
@@ -158,7 +154,6 @@ impl <RSender, TRequester> RumourMill<RSender, TRequester>
         }
 
         pub fn trigger_begin_failure_detection(&mut self) {
-            println!("Beginning failure detection");
             self.timeout_requester.request_timeout(TimeoutRequest::new(Duration::from_secs(1), OnTimeoutAction::DoHealthCheck));
 
             let next_node_to_send_message_to = self.next_live_peer_for_message();
@@ -171,7 +166,7 @@ impl <RSender, TRequester> RumourMill<RSender, TRequester>
         }
 
         pub fn on_timeout_expired(&mut self, request: TimeoutRequest) {
-            println!(">>> Timeout received {:?}", request.action);
+            debug!(">>> Timeout received {:?}", request.action);
             match request.action {
                 OnTimeoutAction::DoHealthCheck => self.trigger_begin_failure_detection(),
                 OnTimeoutAction::CheckPendingPings => self.check_pending_pings(),
@@ -188,11 +183,11 @@ impl <RSender, TRequester> RumourMill<RSender, TRequester>
             let live_peers_to_share = self.node_state.get_live_peers(KnownPeersList::capacity());
             self.send_control_message(id, ControlRequest::JoinAck(live_peers_to_share.into()));
             self.on_member_join(id);
+            self.gossip.remember(Rumour::NodeHasJoin(id));
         }
 
         fn on_member_join(&mut self, id: NodeId) {
             self.add_live_node(id);
-            self.gossip.remember(Rumour::NodeHasJoin(id));
         }
 
         fn on_join_ack(&mut self, ack_from: NodeId, live_nodes: Vec<NodeId>) {
@@ -212,12 +207,8 @@ impl <RSender, TRequester> RumourMill<RSender, TRequester>
             self.node_state.remove_pending_ping(acker);
         }
 
-        fn on_ping_request(&mut self, pinger: NodeId, to_ping: NodeId) {
-
-        }
-
-        fn live_nodes(&self) -> Vec<NodeId>{
-            self.node_state.live_nodes()
+        fn on_ping_request(&mut self, _pinger: NodeId, _to_ping: NodeId) {
+            // TODO
         }
 
         fn next_live_peer_for_message(&mut self) -> Option<NodeId> {
@@ -254,11 +245,11 @@ impl <RSender, TRequester> RumourMill<RSender, TRequester>
             }
 
             if number_of_peers_sent_to == 0 {
-                println!("Nobody to help retrying ping {:?} - will retry locally", to_ping);
+                warn!("Nobody to help retrying ping {:?} - will retry locally", to_ping);
                 let my_id = self.id;
                 self.on_ping_request(my_id, to_ping);
             } else {
-                println!("Asked {} peers to check on node", number_of_peers_sent_to);
+                info!("Asked {} peers to check on node", number_of_peers_sent_to);
             }
 
             self.node_state.add_pending_indirect_ping(to_ping);
@@ -279,12 +270,15 @@ impl <RSender, TRequester> RumourMill<RSender, TRequester>
         fn suspect(&mut self, suspect_node: NodeId) {
             let timeout = self.suspicion_timeout();
             if self.node_state.add_suspect(suspect_node) {
+            info!("Suspect node: {:?}", suspect_node);
                 self.timeout_requester.request_timeout(TimeoutRequest::new(timeout, OnTimeoutAction::CheckFailureSuspect(suspect_node, timeout, 0)));
             }
         }
 
         fn check_failure_suspects(&mut self, suspect: NodeId) {
             self.node_state.accuse_suspect(suspect);
+            self.gossip.forget(suspect);
+            self.gossip.remember(Rumour::NodeHasLeft(suspect));
         }
 }
 
@@ -309,7 +303,6 @@ mod tests {
         }
 
         fn sent_messages(&mut self) -> Vec<OutboundMessage> {
-            println!("Finding sent messages");
             let mut sent = self.sent_messages.lock().unwrap();
             let mut sent_so_far = Vec::with_capacity(sent.len());
             sent_so_far.append(&mut sent);
@@ -321,12 +314,10 @@ mod tests {
             self.sent_messages().iter().filter(|msg| {
                 match msg.content() {
                     &MessageContent::ControlPlain(_, _) => true,
-                    _ => false
                 }
             }).map(|m| {
                 match m.content() {
                     &MessageContent::ControlPlain(ref r, _) => (m.destination(), r.clone()),
-                    _ => panic!()
                 }
             }).collect()
         }
@@ -343,7 +334,6 @@ mod tests {
                                 _ => false
                             }
                         },
-                        _ => false
                     }
                 }
             );
@@ -380,7 +370,6 @@ mod tests {
         fn request_timeout(&mut self, request: TimeoutRequest) -> () {
             println!("<<< set timeout: {:?}", request);
             let mut outstanding_requests = self.requested_timeouts.lock().unwrap();
-            let duration = request.duration();
             match outstanding_requests.binary_search_by_key(&request.duration(), |r| r.duration()) {
                 Ok(idx) => outstanding_requests.insert(idx, request),
                 Err(idx) => outstanding_requests.insert(idx, request),
@@ -431,17 +420,37 @@ mod tests {
     fn remote_node(ip: &str) -> NodeId {
         NodeId(SocketAddr::new(ip.parse().expect("Couldn't parse ip addr"), 2073))
     }
-    
+
+    #[derive(Debug, Clone)]
+    struct NoopRumourObserver {
+        dead_notifications_count: Arc<Mutex<u64>>,
+        joined_notifications_count: Arc<Mutex<u64>>,
+    }
+    impl RumourObserver for NoopRumourObserver {
+        fn on_node_dead(&mut self) -> () { *self.dead_notifications_count.lock().unwrap() += 1;}
+        fn on_node_joined(&mut self) -> () { *self.joined_notifications_count.lock().unwrap() += 1; }
+    }
+
+    fn noop_observer() -> Box<NoopRumourObserver> {
+        Box::new(NoopRumourObserver{dead_notifications_count: Arc::new(Mutex::new(0)), joined_notifications_count: Arc::new(Mutex::new(0))})
+    }
+
+    macro_rules! val {
+        ($e: expr) => {
+            *$e.lock().unwrap()
+        };
+    }
+        
 
     #[test]
     fn shows_self_as_active_from_the_start() {
-        let mut mill = new_mill(localnode(), MockMessageSender::new(), MockTimeoutRequester::new());
+        let mill = new_mill(localnode(), MockMessageSender::new(), MockTimeoutRequester::new(), noop_observer());
         assert_eq!(mill.get_live_nodes(), &[localnode()])
     }
 
     #[test]
     fn adds_joined_node_to_active_list_right_away() {
-        let mut mill = new_mill(localnode(), MockMessageSender::new(), MockTimeoutRequester::new());
+        let mut mill = new_mill(localnode(), MockMessageSender::new(), MockTimeoutRequester::new(), noop_observer());
         let remote_node = remote_node("127.0.0.2");
 
         mill.on_message_received(InboundMessage::bare_control_plain_message(remote_node.0, ControlRequest::MemberJoin));
@@ -454,7 +463,7 @@ mod tests {
     #[test]
     fn responds_to_ping() {
         let mut message_sender = MockMessageSender::new();
-        let mut mill = new_mill(localnode(), message_sender.clone(), MockTimeoutRequester::new());
+        let mut mill = new_mill(localnode(), message_sender.clone(), MockTimeoutRequester::new(), noop_observer());
         let remote_node = remote_node("127.0.0.2");
 
         mill.on_message_received(InboundMessage::bare_control_plain_message(remote_node.0, ControlRequest::Ping));
@@ -465,7 +474,7 @@ mod tests {
     #[test]
     fn do_join_sends_join_messages_to_known_nodes() {
         let mut message_sender = MockMessageSender::new();
-        let mut mill = new_mill(localnode(), message_sender.clone(), MockTimeoutRequester::new());
+        let mut mill = new_mill(localnode(), message_sender.clone(), MockTimeoutRequester::new(), noop_observer());
         let remote_node = remote_node("127.0.0.2");
 
         mill.do_join(&[remote_node.0]);
@@ -477,7 +486,7 @@ mod tests {
     #[test]
     fn do_join_schedules_a_health_check_timeout() {
         let mut timeout_requester = MockTimeoutRequester::new();
-        let mut mill = new_mill(localnode(), MockMessageSender::new(), timeout_requester.clone());
+        let mut mill = new_mill(localnode(), MockMessageSender::new(), timeout_requester.clone(), noop_observer());
         let remote_node = remote_node("127.0.0.2");
 
         mill.do_join(&[remote_node.0]);
@@ -488,7 +497,7 @@ mod tests {
 
     #[test]
     fn remote_nodes_marked_live_when_join_ack_received() {
-        let mut mill = new_mill(localnode(), MockMessageSender::new(), MockTimeoutRequester::new());
+        let mut mill = new_mill(localnode(), MockMessageSender::new(), MockTimeoutRequester::new(), noop_observer());
         let remote_node1 = remote_node("127.0.0.2");
         let remote_node2 = remote_node("127.0.0.3");
         let remote_node3 = remote_node("127.0.0.4");
@@ -511,7 +520,7 @@ mod tests {
     #[test]
     fn health_check_pings_some_known_nodes() {
         let mut message_sender = MockMessageSender::new();
-        let mut mill = new_mill(localnode(), message_sender.clone(), MockTimeoutRequester::new());
+        let mut mill = new_mill(localnode(), message_sender.clone(), MockTimeoutRequester::new(), noop_observer());
         let remote_node = remote_node("127.0.0.2");
 
         mill.on_message_received(
@@ -528,9 +537,9 @@ mod tests {
 
     #[test]
     fn when_node_responds_to_ping_then_it_remains_healthy() {
-        let mut message_sender = MockMessageSender::new();
+        let message_sender = MockMessageSender::new();
         let mut timouter = MockTimeoutRequester::new();
-        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone());
+        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone(), noop_observer());
 
         let remote_node = remote_node("127.0.0.2");
         mill.on_message_received(
@@ -552,7 +561,7 @@ mod tests {
     fn when_node_doesnt_respond_to_ping_then_ping_req_sent() {
         let mut message_sender = MockMessageSender::new();
         let mut timouter = MockTimeoutRequester::new();
-        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone());
+        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone(), noop_observer());
 
         let remote_node1 = remote_node("127.0.0.2");
         let remote_node2 = remote_node("127.0.0.3");
@@ -579,9 +588,9 @@ mod tests {
 
     #[test]
     fn when_node_doesnt_respond_to_ping_or_ping_req_then_marked_as_suspect() {
-        let mut message_sender = MockMessageSender::new();
+        let message_sender = MockMessageSender::new();
         let mut timouter = MockTimeoutRequester::new();
-        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone());
+        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone(), noop_observer());
 
         let remote_node1 = remote_node("127.0.0.2");
         let remote_node2 = remote_node("127.0.0.3");
@@ -604,9 +613,9 @@ mod tests {
 
     #[test]
     fn after_node_has_been_suspect_on_timeout_remove_from_live_set() {
-        let mut message_sender = MockMessageSender::new();
+        let message_sender = MockMessageSender::new();
         let mut timouter = MockTimeoutRequester::new();
-        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone());
+        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone(), noop_observer());
 
         let remote_node1 = remote_node("127.0.0.2");
         let remote_node2 = remote_node("127.0.0.3");
@@ -631,7 +640,7 @@ mod tests {
     fn if_no_peers_then_failed_ping_still_results_in_node_suspected() {
         let mut message_sender = MockMessageSender::new();
         let mut timouter = MockTimeoutRequester::new();
-        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone());
+        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone(), noop_observer());
 
         let remote_node = remote_node("127.0.0.2");
 
@@ -667,7 +676,7 @@ mod tests {
     fn acks_join_requests_with_any_known_nodes() {
         let mut message_sender = MockMessageSender::new();
         let timouter = MockTimeoutRequester::new();
-        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone());
+        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone(), noop_observer());
 
         let remote_node1 = remote_node("127.0.0.2");
         let remote_node2 = remote_node("127.0.0.3");
@@ -688,15 +697,14 @@ mod tests {
     fn gossip_from(msg: &OutboundMessage) -> Option<&RumourList> {
         match msg.content() {
             &MessageContent::ControlPlain(_, ref rl) => Some(rl),
-            _ => None
         }
     }
 
     #[test]
-    fn other_nodes_will_hear_about_memebership_through_control_messages() {
+    fn other_nodes_will_hear_about_membership_through_control_messages() {
         let mut message_sender = MockMessageSender::new();
         let mut timouter = MockTimeoutRequester::new();
-        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone());
+        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone(), noop_observer());
 
         let remote1 = remote_node("127.0.0.2");
         let remote2 = remote_node("127.0.0.3");
@@ -719,10 +727,37 @@ mod tests {
     }
 
     #[test]
-    fn node_can_pick_up_peer_join_through_control_plane_gossip() {
+    fn once_node_is_dead_stop_gossipping_that_it_has_joined() {
         let mut message_sender = MockMessageSender::new();
         let mut timouter = MockTimeoutRequester::new();
-        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone());
+        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone(), noop_observer());
+
+        let remote2 = remote_node("127.0.0.2");
+        let remote3 = remote_node("127.0.0.3");
+
+        mill.on_message_received(bare_join_message(remote2));
+        mill.trigger_begin_failure_detection();
+
+        progress_timeout(&mut mill, &mut timouter, Duration::from_secs(20)); // enough time for remote2 to be marked as failed
+
+        mill.on_message_received(bare_join_message(remote3));
+        
+        let sent_messages = message_sender.sent_messages();
+        assert!(!sent_messages.iter().any(|m| {
+            match gossip_from(&m) {
+                Some(rumours) => {
+                    (m.destination() == remote3.0) && rumours.contains(&Rumour::NodeHasJoin(remote2))
+                },
+                _ => false
+            }
+        }));
+    }
+
+    #[test]
+    fn node_can_pick_up_peer_join_through_control_plane_gossip() {
+        let message_sender = MockMessageSender::new();
+        let timouter = MockTimeoutRequester::new();
+        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone(), noop_observer());
 
         let remote1 = remote_node("127.0.0.2");
         let remote2 = remote_node("127.0.0.3");
@@ -731,5 +766,23 @@ mod tests {
             InboundMessage::new(remote1.0, ControlRequest::Ping, vec![Rumour::NodeHasJoin(remote2)]));
             
         assert!(mill.get_live_nodes().contains(&remote2));
+    }
+
+    #[test]
+    fn observer_received_node_lifecycle_events() {
+        let observer = noop_observer();
+        let message_sender = MockMessageSender::new();
+        let mut timouter = MockTimeoutRequester::new();
+        let mut mill = new_mill(localnode(), message_sender.clone(), timouter.clone(), observer.clone());
+
+        let remote_node = remote_node("127.0.0.2");
+        mill.on_message_received(InboundMessage::bare_control_plain_message(remote_node.0, ControlRequest::MemberJoin));
+        assert_eq!(val!(observer.joined_notifications_count), 1);
+        assert_eq!(val!(observer.dead_notifications_count), 0);
+
+        mill.trigger_begin_failure_detection();
+        progress_timeout(&mut mill, &mut timouter, Duration::from_secs(12));
+        assert_eq!(val!(observer.dead_notifications_count), 1);
+
     }
 }

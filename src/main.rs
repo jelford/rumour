@@ -1,4 +1,3 @@
-
 #[macro_use]
 extern crate error_chain;
 #[macro_use]
@@ -6,6 +5,10 @@ extern crate serde_derive;
 extern crate bincode;
 #[macro_use]
 extern crate clap;
+
+#[macro_use] extern crate log;
+extern crate env_logger;
+
 
 extern crate futures;
 extern crate rand;
@@ -67,7 +70,17 @@ fn run() -> Result<()> {
 
     println!("Specified port: {}", listen_port);
     println!("Peer addresses: {:?}", peer_addresses);
+
+    let on_node_dies = || { println!("Node died"); };
+    let on_node_join = || { println!("Node joined"); };
+
+    let observer = node::RumourObserverBuilder::new()
+                    .on_node_dead(&on_node_dies)
+                    .on_node_joined(&on_node_join)
+                    .build();
+
+    env_logger::init();
     
     node::server(node::Config::listen_local(listen_port, peer_addresses))?
-        .serve()
+        .serve(observer)
 }

@@ -8,8 +8,9 @@ use std::vec::{Vec, Drain};
 use rand;
 
 use super::codec::{NodeId};
+use super::RumourObserver;
 
-pub(crate) fn new() -> NodeLivenessState {
+pub(crate) fn new<'a>(observer: Box<RumourObserver + 'a>) -> NodeLivenessState<'a> {
     NodeLivenessState {
         live_nodes: HashSet::new(),
         live_node_round_robin: Vec::new(),
@@ -17,11 +18,13 @@ pub(crate) fn new() -> NodeLivenessState {
         pending_pings: Vec::new(),
         pending_ping_reqs: Vec::new(),
         suspect_nodes: Vec::new(),
+        observer: observer,
     }
 }
 
+
 #[derive(Debug)]
-pub(crate) struct NodeLivenessState {
+pub(crate) struct NodeLivenessState<'a> {
 
     live_nodes: HashSet<NodeId>,
     live_node_round_robin_idx : usize,
@@ -30,6 +33,8 @@ pub(crate) struct NodeLivenessState {
     pending_ping_reqs: Vec<NodeId>,
 
     suspect_nodes: Vec<NodeId>,
+
+    observer: Box<RumourObserver + 'a>,
 }
 
 fn add_to_vec<T>(thing: T, destination: &mut Vec<T>) -> bool
@@ -44,7 +49,7 @@ fn add_to_vec<T>(thing: T, destination: &mut Vec<T>) -> bool
     true
 }
 
-impl NodeLivenessState {
+impl <'a> NodeLivenessState<'a> {
     pub(crate) fn get_live_nodes(&self) -> Vec<NodeId> {
         to_vec(&self.live_nodes)
     }
@@ -67,11 +72,7 @@ impl NodeLivenessState {
             }
         }
     }
-
-    pub(crate) fn live_nodes(&self) -> Vec<NodeId> {
-        to_vec(&self.live_nodes)
-    }
-
+    
     pub(crate) fn next_live_peer_for_message(&mut self) -> Option<NodeId> {
         if self.live_node_round_robin.is_empty() {
             return None;
@@ -118,6 +119,7 @@ impl NodeLivenessState {
     pub(crate) fn add_live_node(&mut self, id: NodeId) {
         if self.live_nodes.insert(id) {
             self.live_node_round_robin.push(id);
+            (*self.observer).on_node_joined();
         }
     }
 
@@ -132,14 +134,13 @@ impl NodeLivenessState {
                 break;
             }
         }
-
-        if !found {
-            println!("Failed to find node to remove {:?} from {:?}", node_to_remove, self.live_node_round_robin);
+        if found {
+            (*self.observer).on_node_dead();
         }
 
         self.live_nodes.remove(&node_to_remove);
 
-        println!("After removing {:?}, remaining live nodes: {:?}", node_to_remove, self.live_node_round_robin);
+        debug!("After removing {:?}, remaining live nodes: {:?}", node_to_remove, self.live_node_round_robin);
     }
 
     pub(crate) fn add_pending_indirect_ping(&mut self, node_being_pinged: NodeId) {

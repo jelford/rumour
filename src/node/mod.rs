@@ -61,9 +61,9 @@ struct TokioTimeoutRequester {
     timeout_handler: Sender<TimeoutRequest>,
 }
 
-macro_rules! ignore_error {
+macro_rules! crash_on_error {
     () => {
-        |_| ()
+        |_| -> () {panic!("error occurred");}
     };
 }
 
@@ -78,22 +78,81 @@ impl TimeoutRequester for TokioTimeoutRequester {
         let timeout_handler = self.timeout_handler.clone();
         let duration = request.duration();
         let fut = self.timer.sleep(duration)
-            .map_err(ignore_error!())
+            .map_err(crash_on_error!())
             .then(move |_| {
                 timeout_handler.send(request)
                     .and_then(discard_result!())
-                    .map_err(ignore_error!())
+                    .map_err(crash_on_error!())
             });
 
         self.handle.spawn(fut);
     }
 }
 
+pub trait RumourObserver : ::std::fmt::Debug {
+    fn on_node_joined(&mut self) -> ();
+    fn on_node_dead(&mut self) -> ();
+}
 
+
+pub struct RumourObserverBuilder<'a> {
+    _on_node_joined: &'a Fn() -> (),
+    _on_node_dead: &'a Fn() -> (),
+}
+
+pub struct DefaultRumourObserverImpl<'a> {
+    _on_node_joined: &'a Fn() -> (),
+    _on_node_dead: &'a Fn() -> (),
+}
+
+impl <'a> RumourObserver for DefaultRumourObserverImpl<'a> {
+
+    fn on_node_joined(&mut self) {
+        (self._on_node_joined)();
+    }
+
+    fn on_node_dead(&mut self) {
+        (self._on_node_dead)();
+    }
+}
+
+impl <'a> ::std::fmt::Debug for DefaultRumourObserverImpl<'a> {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        write!(f, "<RumourObserver>")
+    }
+}
+
+impl <'a> RumourObserverBuilder<'a> {
+    pub fn new() -> Self {
+        RumourObserverBuilder{
+            _on_node_joined: &|| {},
+            _on_node_dead: &|| {},
+        }
+    }
+
+    pub fn on_node_joined(mut self, joined_callback: &'a Fn() ->()) -> Self {
+        self._on_node_joined = joined_callback;
+        self
+    }
+
+    pub fn on_node_dead(mut self, dead_callback: &'a Fn() ->()) -> Self {
+        self._on_node_dead = dead_callback;
+        self
+    }
+
+    pub fn build(self) -> DefaultRumourObserverImpl<'a>  {
+        DefaultRumourObserverImpl  {
+            _on_node_joined: self._on_node_joined,
+            _on_node_dead: self._on_node_dead,
+        }
+    }
+}
 
 
 impl Server {
-    pub fn serve(&self) -> Result<()> {
+    pub fn serve<Observer>(&self, observer: Observer) -> Result<()>
+        where Observer: RumourObserver + Sized {
+            
         let mut core = Core::new()?;
         let handle = core.handle();
         let timer = Timer::default();
@@ -106,7 +165,7 @@ impl Server {
                                          Receiver<OutboundMessage>) = mpsc::channel(1);
 
         let out_future = outbound_rx
-            .forward(outbound_socket.sink_map_err(ignore_error!()))
+            .forward(outbound_socket.sink_map_err(crash_on_error!()))
             .and_then(discard_result!());
 
         let sender = TokioMessageSender {
@@ -122,36 +181,39 @@ impl Server {
             timeout_handler: timeout_tx.clone(),
         };
 
-        let mill = Arc::new(Mutex::new(new_mill(NodeId(self.config.listen_port), sender, timeouter)));
-        
-        let this_mill = mill.clone();
+        let observer = Box::new(observer);
+        {
+            let mill = Arc::new(Mutex::new(new_mill(NodeId(self.config.listen_port), sender, timeouter, observer)));
+            
+            let this_mill = mill.clone();
 
-        let timeout_stream = timeout_rx.for_each(move |request| {
-            let mut mill = this_mill.lock().unwrap();
-            mill.on_timeout_expired(request);
-            future::ok(())
-        }).and_then(discard_result!());
-
-        let this_mill = mill.clone();
-        let in_stream = incoming_socket
-            .and_then(move |msg| {
-                this_mill.lock().unwrap().on_message_received(msg);
+            let timeout_stream = timeout_rx.for_each(move |request| {
+                let mut mill = this_mill.lock().unwrap();
+                mill.on_timeout_expired(request);
                 future::ok(())
-            })
-            .for_each(discard_result!())
-            .map_err(ignore_error!());
+            }).and_then(discard_result!());
 
-        let this_mill = mill.clone();
-        let initial_event = timer.sleep(Duration::from_secs(1))
-            .map_err(ignore_error!())
-            .and_then(move |_| {
-            this_mill.lock().unwrap().do_join(&self.config.peer_addresses);
-            future::ok(())
-        });
+            let this_mill = mill.clone();
+            let in_stream = incoming_socket
+                .and_then(move |msg| {
+                    this_mill.lock().unwrap().on_message_received(msg);
+                    future::ok(())
+                })
+                .for_each(discard_result!())
+                .map_err(crash_on_error!());
 
-        let joined_stream = out_future.join(in_stream).join(timeout_stream).join(initial_event).then(discard_result!());
+            let this_mill = mill.clone();
+            let initial_event = timer.sleep(Duration::from_secs(1))
+                .map_err(crash_on_error!())
+                .and_then(move |_| {
+                this_mill.lock().unwrap().do_join(&self.config.peer_addresses);
+                future::ok(())
+            });
 
-        core.run(joined_stream)
+            let joined_stream = out_future.join(in_stream).join(timeout_stream).join(initial_event).then(discard_result!());
+
+            core.run(joined_stream)
+        }
     }
 }
 
