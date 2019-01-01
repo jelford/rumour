@@ -9,6 +9,9 @@ Implemented:
 
 ## goal
 
+The primary goal is for me to learn a bit of Rust, and familiarize myself with Tokio, futures,
+and the other important parts of Rust's networking story.
+
 An implementation of the [SWIM Protocol](https://www.cs.cornell.edu/~asdas/research/dsn02-swim.pdf) in safe, asyncronous rust.
 
 The implementation is based on HashiCorp's [Serf](https://www.serf.io/docs/internals/gossip.html).
